@@ -114,3 +114,4 @@ UI 组件在 `src/components/ui/`（shadcn）。不要把业务逻辑塞进 ui �
 - 个人 `@outlook.com` / `@hotmail.com` 已不支持账号+密码 SMTP；当前实现没有微软 OAuth
 - QQ 错误 `501 Mail from address must be same as authorization user`：发件人必须等于 SMTP 用户，send 路径已按账号覆盖 From
 - 密钥一旦在生成时从池中扣除，重新生成不会自动退回（避免重复发出同一把 Key）
+- 署名只允许一段：模型不得自己签名；`withFooter` 会先剥掉文末名字/工作室/分隔线，再追加一次。生成和发出都走这个函数，避免叠三层签名

@@ -10,20 +10,49 @@ export function requestOrigin(request: Request) {
   return new URL(request.url).origin;
 }
 
-export function withFooter(body: string, campaign: Campaign) {
-  const footer = [
-    "——",
-    campaign.senderName,
-    [campaign.companyName, campaign.brand ? `《${campaign.brand}》` : ""]
-      .filter(Boolean)
-      .join(" · "),
-  ]
+function compactIdentity(campaign: Campaign) {
+  return [campaign.companyName, campaign.brand ? `《${campaign.brand}》` : ""]
+    .map((part) => part.trim())
     .filter(Boolean)
-    .join("\n");
-  if (body.includes(campaign.senderName) && body.trim().endsWith(campaign.senderName)) {
-    return body.trim();
+    .join(" · ");
+}
+
+function isSignatureLine(line: string, campaign: Campaign) {
+  const text = line.trim();
+  if (!text) return true;
+  if (text.length > 48) return false;
+  if (/^[—\-–_]{2,}$/.test(text)) return true;
+
+  const name = campaign.senderName.trim();
+  const company = campaign.companyName.trim();
+  const brand = campaign.brand.trim();
+  const identity = compactIdentity(campaign);
+  const candidates = [
+    name,
+    company,
+    brand,
+    brand ? `《${brand}》` : "",
+    identity,
+    [name, company].filter(Boolean).join(" "),
+    [name, company].filter(Boolean).join(" · "),
+  ].filter(Boolean);
+
+  return candidates.some((item) => text === item);
+}
+
+export function stripTrailingSignature(body: string, campaign: Campaign) {
+  const lines = body.replace(/\s+$/, "").split(/\r?\n/);
+  while (lines.length > 0 && isSignatureLine(lines[lines.length - 1] ?? "", campaign)) {
+    lines.pop();
   }
-  return `${body.trim()}\n\n${footer}`;
+  return lines.join("\n").trim();
+}
+
+export function withFooter(body: string, campaign: Campaign) {
+  const core = stripTrailingSignature(body, campaign);
+  const footer = ["——", campaign.senderName.trim(), compactIdentity(campaign)].filter(Boolean).join("\n");
+  if (!core) return footer;
+  return `${core}\n\n${footer}`;
 }
 
 export function looksDeceptive(subject: string) {

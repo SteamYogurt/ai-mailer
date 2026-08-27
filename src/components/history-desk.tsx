@@ -57,8 +57,13 @@ export function HistoryDesk() {
               size="sm"
               onClick={async () => {
                 if (!confirm("清空全部发信记录？")) return;
-                await fetch("/api/inbox", { method: "DELETE" });
+                const response = await fetch("/api/inbox", { method: "DELETE" });
+                if (!response.ok) {
+                  toast.error("清空失败");
+                  return;
+                }
                 await load();
+                toast.success("已清空记录");
               }}
             >
               <Trash2 />
@@ -135,8 +140,13 @@ export function HistoryDesk() {
                     size="icon-xs"
                     variant="ghost"
                     onClick={async () => {
-                      await fetch(`/api/inbox?id=${item.id}`, { method: "DELETE" });
+                      const response = await fetch(`/api/inbox?id=${item.id}`, { method: "DELETE" });
+                      if (!response.ok) {
+                        toast.error("删除失败");
+                        return;
+                      }
                       await load(applied || undefined);
+                      toast.success("已删除");
                     }}
                   >
                     <Trash2 />

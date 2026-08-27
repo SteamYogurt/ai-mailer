@@ -56,7 +56,7 @@ export function AiDesk() {
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "保存失败");
       setConfigured(Boolean(data.configured));
-      toast.success("AI 配置已保存到 userdata/settings.json");
+      toast.success("已保存");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "保存失败");
     } finally {
@@ -83,6 +83,8 @@ export function AiDesk() {
       if (!response.ok) throw new Error(data.error || "对话失败");
       setMessages(data.messages ?? []);
     } catch (error) {
+      setInput(content);
+      setMessages((current) => current.filter((item) => item.id !== "temp"));
       toast.error(error instanceof Error ? error.message : "对话失败");
     } finally {
       setSending(false);
@@ -131,8 +133,13 @@ export function AiDesk() {
               variant="ghost"
               size="sm"
               onClick={async () => {
-                await fetch("/api/chat", { method: "DELETE" });
+                const response = await fetch("/api/chat", { method: "DELETE" });
+                if (!response.ok) {
+                  toast.error("清空失败");
+                  return;
+                }
                 setMessages([]);
+                toast.success("已清空对话");
               }}
             >
               <Trash2 />

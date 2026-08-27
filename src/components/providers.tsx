@@ -7,7 +7,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
   return (
     <ThemeProvider attribute="class" defaultTheme="light" enableSystem={false}>
       {children}
-      <Toaster position="top-center" theme="light" />
+      <Toaster position="top-center" theme="light" duration={5000} />
     </ThemeProvider>
   );
 }

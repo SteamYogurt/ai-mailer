@@ -38,6 +38,7 @@ export async function generateDrafts(
           "You write short outreach emails from an indie game developer to video creators (Bilibili, YouTube, Douyin, streamers).",
           'Return JSON {"drafts":[{"email","subject","body"}]}. The word json and this exact shape are required.',
           "Rules: subject must clearly say it is a playtest/collaboration invite; mention the creator's channel or recent work when provided; do not invent keys, discounts, or praise; no fake urgency, invoices, or Re:/Fwd:; plain text; default Chinese unless the creator looks English-first.",
+          "Do not close with a signature, sender name, studio name, game title, divider, or identity block. The application appends one signature after you return the body.",
           hasKeys
             ? "If steamKeys are provided for a recipient, include those exact keys in the email body. Never invent extra keys."
             : "Do not mention Steam keys unless the developer asked in extra instructions.",

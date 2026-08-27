@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import { toast } from "sonner";
 import {
   AlertCircle,
@@ -40,6 +41,7 @@ import {
   type Campaign,
   type Draft,
   type GameRecord,
+  type InboxMessage,
   type SendMode,
   type SmtpConfig,
   type Tone,
@@ -87,6 +89,12 @@ export function Studio() {
   const [testingSmtp, setTestingSmtp] = useState(false);
   const [aiConfigured, setAiConfigured] = useState<boolean | null>(null);
   const [activeDraftId, setActiveDraftId] = useState<string | null>(null);
+  const [lastSend, setLastSend] = useState<{
+    sent: number;
+    failed: number;
+    mode: SendMode;
+    results: InboxMessage[];
+  } | null>(null);
   const saveTimer = useRef<number | null>(null);
 
   const drafts = game?.drafts ?? [];
@@ -112,16 +120,20 @@ export function Studio() {
     setGame(next);
     setGames((current) => current.map((item) => (item.id === next.id ? next : item)));
     const run = async () => {
-      await fetch("/api/games", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ game: next }),
-      });
+      try {
+        const response = await fetch("/api/games", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ game: next }),
+        });
+        if (!response.ok) throw new Error("保存失败");
+        return true;
+      } catch {
+        toast.error("游戏数据没存上，请再点一次保存");
+        return false;
+      }
     };
-    if (immediate) {
-      void run();
-      return;
-    }
+    if (immediate) return run();
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
     saveTimer.current = window.setTimeout(() => void run(), 500);
   }
@@ -164,6 +176,7 @@ export function Studio() {
       true,
     );
     if (result.recipients.length > 0) toast.success(`已读入 ${result.recipients.length} 人`);
+    else toast.error("没有有效联系人");
   }
 
   function addKeys(raw: string) {
@@ -211,7 +224,7 @@ export function Studio() {
       persist(next, true);
       setActiveDraftId(data.drafts[0]?.recipientId ?? null);
       setStep(3);
-      toast.success("草稿已生成");
+      toast.success(`已生成 ${data.drafts.length} 封草稿`);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "生成失败");
     } finally {
@@ -221,13 +234,15 @@ export function Studio() {
 
   async function send() {
     if (!game) return;
+    setLastSend(null);
     setSending(true);
     try {
-      await fetch("/api/smtp", {
+      const smtpSave = await fetch("/api/smtp", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(smtp),
       });
+      if (!smtpSave.ok) throw new Error("邮箱信息没存上");
       const response = await fetch("/api/send", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -242,8 +257,22 @@ export function Studio() {
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "发送失败");
-      toast.success(mode === "smtp" ? `已发出 ${data.sent} 封` : `已写入记录 ${data.sent} 封（未真发）`);
-      if (data.failed) toast.error(`${data.failed} 封失败`);
+      const summary = {
+        sent: Number(data.sent) || 0,
+        failed: Number(data.failed) || 0,
+        mode,
+        results: (data.results ?? []) as InboxMessage[],
+      };
+      setLastSend(summary);
+      if (summary.failed && !summary.sent) {
+        toast.error(`发送失败：${summary.results[0]?.error || `${summary.failed} 封都没发出`}`);
+      } else if (summary.failed) {
+        toast.error(`发出 ${summary.sent} 封，失败 ${summary.failed} 封`);
+      } else {
+        toast.success(
+          mode === "smtp" ? `已从邮箱发出 ${summary.sent} 封` : `已写入 ${summary.sent} 封记录（未真发）`,
+        );
+      }
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "发送失败");
     } finally {
@@ -291,6 +320,7 @@ export function Studio() {
                 });
                 setGame(next);
                 setActiveDraftId(next.drafts[0]?.recipientId ?? null);
+                setLastSend(null);
               }
             }}
           >
@@ -309,10 +339,17 @@ export function Studio() {
             variant="outline"
             onClick={async () => {
               persist(game, true);
-              const response = await fetch("/api/games", { method: "PUT" });
-              const data = await response.json();
-              await refreshGames(data.game.id);
-              setStep(1);
+              try {
+                const response = await fetch("/api/games", { method: "PUT" });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || "新建失败");
+                await refreshGames(data.game.id);
+                setStep(1);
+                setLastSend(null);
+                toast.success("已新建游戏");
+              } catch (error) {
+                toast.error(error instanceof Error ? error.message : "新建失败");
+              }
             }}
           >
             <Plus />
@@ -324,8 +361,14 @@ export function Studio() {
               if (!confirm("删除这个游戏的全部配置、名单和密钥？发信记录仍会保留。")) return;
               const response = await fetch(`/api/games?id=${game.id}`, { method: "DELETE" });
               const data = await response.json();
+              if (!response.ok) {
+                toast.error(data.error || "删除失败");
+                return;
+              }
               setGames(data.games ?? []);
               await refreshGames(data.activeId);
+              setLastSend(null);
+              toast.success("已删除这个游戏");
             }}
           >
             <Trash2 />
@@ -406,7 +449,14 @@ export function Studio() {
                 />
               </Field>
             </div>
-            <Button className="mt-4" variant="outline" onClick={() => persist(game, true)}>
+            <Button
+              className="mt-4"
+              variant="outline"
+              onClick={async () => {
+                const ok = await persist(game, true);
+                if (ok) toast.success("已保存");
+              }}
+            >
               <Save />
               保存这个游戏
             </Button>
@@ -556,7 +606,7 @@ export function Studio() {
               onClick={() => void generate()}
             >
               {generating ? <Loader2 className="animate-spin" /> : <PenLine />}
-              生成草稿
+              {generating ? "正在生成…" : "生成草稿"}
             </Button>
           </div>
         </section>
@@ -646,7 +696,7 @@ export function Studio() {
               />
               <div className="mt-4 flex gap-2">
                 <Button variant="outline" disabled={generating} onClick={() => void generate()}>
-                  重新生成
+                  {generating ? "正在生成…" : "重新生成"}
                 </Button>
                 <Button className="rounded-full" disabled={includedDrafts.length === 0} onClick={() => setStep(4)}>
                   去发出（{includedDrafts.length} 封）
@@ -765,18 +815,65 @@ export function Studio() {
               onClick={() => void send()}
             >
               {sending ? <Loader2 className="animate-spin" /> : <Send />}
-              {mode === "smtp" ? "从我的邮箱发出" : "只写入记录"}
+              {sending ? "正在发送…" : mode === "smtp" ? "从我的邮箱发出" : "只写入记录"}
             </Button>
+            {lastSend ? (
+              <p className="mt-3 text-sm">
+                {lastSend.failed === 0 ? (
+                  <span>
+                    {lastSend.mode === "smtp"
+                      ? `已发出 ${lastSend.sent} 封。`
+                      : `已写入 ${lastSend.sent} 封记录（未真发）。`}
+                  </span>
+                ) : (
+                  <span className="text-destructive">
+                    成功 {lastSend.sent} 封，失败 {lastSend.failed} 封
+                    {lastSend.results.find((item) => item.status === "failed")?.error
+                      ? `：${lastSend.results.find((item) => item.status === "failed")?.error}`
+                      : "。"}
+                  </span>
+                )}{" "}
+                <Link href="/history" className="text-muted-foreground underline">
+                  查看记录
+                </Link>
+              </p>
+            ) : null}
           </div>
           <div className="rounded-3xl bg-card p-5 ring-1 ring-foreground/10 sm:p-6">
             <h3 className="font-heading text-lg">本次队列</h3>
             <ul className="mt-3 max-h-[480px] space-y-2 overflow-auto">
-              {includedDrafts.map((draft) => (
-                <li key={draft.recipientId} className="rounded-xl bg-muted/60 px-3 py-2">
-                  <div className="text-sm font-medium">{draft.name || draft.email}</div>
-                  <div className="truncate text-xs text-muted-foreground">{draft.subject}</div>
-                </li>
-              ))}
+              {includedDrafts.map((draft) => {
+                const result = lastSend?.results.find(
+                  (item) => item.to.toLowerCase() === draft.email.toLowerCase(),
+                );
+                return (
+                  <li key={draft.recipientId} className="rounded-xl bg-muted/60 px-3 py-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="text-sm font-medium">{draft.name || draft.email}</div>
+                      {sending ? (
+                        <span className="text-xs text-muted-foreground">发送中</span>
+                      ) : result ? (
+                        <span
+                          className={cn(
+                            "text-xs",
+                            result.status === "sent" ? "text-muted-foreground" : "text-destructive",
+                          )}
+                        >
+                          {result.status === "sent"
+                            ? lastSend?.mode === "smtp"
+                              ? "已发"
+                              : "已记"
+                            : "失败"}
+                        </span>
+                      ) : null}
+                    </div>
+                    <div className="truncate text-xs text-muted-foreground">{draft.subject}</div>
+                    {result?.error ? (
+                      <div className="mt-0.5 truncate text-xs text-destructive">{result.error}</div>
+                    ) : null}
+                  </li>
+                );
+              })}
             </ul>
           </div>
         </section>
