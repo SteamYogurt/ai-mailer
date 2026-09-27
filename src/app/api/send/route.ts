@@ -1,5 +1,6 @@
 import { looksDeceptive, withFooter } from "@/lib/compliance";
-import { sendSmtpMail, verifySmtp } from "@/lib/mailer";
+import { withoutSentDrafts } from "@/lib/drafts";
+import { explainSmtpError, sendSmtpBatch } from "@/lib/mailer";
 import { appendInbox, getGame, getSmtp, saveGame, saveSmtp } from "@/lib/store";
 import {
   MAX_RECIPIENTS,
@@ -10,6 +11,8 @@ import {
   type SendMode,
   type SmtpConfig,
 } from "@/lib/types";
+
+export const maxDuration = 300;
 
 export async function POST(request: Request) {
   const body = (await request.json()) as {
@@ -50,74 +53,75 @@ export async function POST(request: Request) {
     if (!smtp.host || !smtp.port || !smtp.user || !smtp.pass) {
       return Response.json({ error: "请填写 SMTP 主机、端口、账号和授权码" }, { status: 400 });
     }
-    try {
-      await verifySmtp(smtp);
-      await saveSmtp(smtp);
-    } catch (error) {
-      return Response.json(
-        { error: `SMTP 校验失败：${error instanceof Error ? error.message : "未知错误"}` },
-        { status: 400 },
-      );
-    }
+    await saveSmtp(smtp);
   }
 
   const results: InboxMessage[] = [];
 
-  for (const draft of drafts) {
-    const email = draft.email.trim().toLowerCase();
-    const bodyText = withFooter(draft.body, campaign);
-    try {
-      if (mode === "smtp") {
-        await sendSmtpMail({
-          smtp,
-          fromName: campaign.senderName,
-          fromEmail,
-          to: email,
-          subject: draft.subject,
-          body: bodyText,
-        });
+  const pushResult = (
+    draft: Draft,
+    email: string,
+    bodyText: string,
+    status: InboxMessage["status"],
+    error?: string,
+  ) => {
+    results.push({
+      id: crypto.randomUUID(),
+      at: new Date().toISOString(),
+      mode,
+      gameId: body.gameId,
+      gameName: body.gameName || campaign.brand,
+      to: email,
+      toName: draft.name,
+      from: fromEmail,
+      fromName: campaign.senderName,
+      subject: draft.subject,
+      body: bodyText,
+      keys: draft.keys,
+      status,
+      error,
+    });
+  };
+
+  if (mode === "smtp") {
+    const prepared = drafts.map((draft) => ({
+      draft,
+      email: draft.email.trim().toLowerCase(),
+      bodyText: withFooter(draft.body, campaign),
+    }));
+    const batch = await sendSmtpBatch({
+      smtp,
+      fromName: campaign.senderName,
+      fromEmail,
+      messages: prepared.map((item) => ({
+        to: item.email,
+        subject: item.draft.subject,
+        body: item.bodyText,
+      })),
+    });
+    prepared.forEach((item, index) => {
+      const error = batch.errors[index];
+      if (error) {
+        pushResult(item.draft, item.email, item.bodyText, "failed", explainSmtpError(error));
+      } else {
+        pushResult(item.draft, item.email, item.bodyText, "sent");
       }
-      results.push({
-        id: crypto.randomUUID(),
-        at: new Date().toISOString(),
-        mode,
-        gameId: body.gameId,
-        gameName: body.gameName || campaign.brand,
-        to: email,
-        toName: draft.name,
-        from: fromEmail,
-        fromName: campaign.senderName,
-        subject: draft.subject,
-        body: bodyText,
-        keys: draft.keys,
-        status: "sent",
-      });
-    } catch (error) {
-      results.push({
-        id: crypto.randomUUID(),
-        at: new Date().toISOString(),
-        mode,
-        gameId: body.gameId,
-        gameName: body.gameName || campaign.brand,
-        to: email,
-        toName: draft.name,
-        from: fromEmail,
-        fromName: campaign.senderName,
-        subject: draft.subject,
-        body: bodyText,
-        keys: draft.keys,
-        status: "failed",
-        error: error instanceof Error ? error.message : "发送失败",
-      });
+    });
+  } else {
+    for (const draft of drafts) {
+      const email = draft.email.trim().toLowerCase();
+      const bodyText = withFooter(draft.body, campaign);
+      pushResult(draft, email, bodyText, "sent");
     }
   }
 
   await appendInbox(results);
 
-  if (body.gameId) {
+  const sentEmails = results.filter((item) => item.status === "sent").map((item) => item.to);
+  if (body.gameId && sentEmails.length > 0) {
     const game = await getGame(body.gameId);
     if (game) {
-      await saveGame({ ...game, drafts: game.drafts });
+      await saveGame({ ...game, drafts: withoutSentDrafts(game.drafts, sentEmails) });
     }
   }
 

@@ -26,8 +26,6 @@ export function emptyGame(partial?: Partial<GameRecord>): GameRecord {
     createdAt: now,
     updatedAt: now,
     ...emptyCampaign(),
-    recipients: [],
-    recipientCsv: "",
     keys: [],
     attachKeys: false,
     keysPerEmail: 1,
@@ -43,5 +41,6 @@ export const sampleRecipients = (): Recipient[] => [
     name: "迟焰",
     company: "B 站「迟焰在玩」",
     note: "最近在玩短篇叙事解谜，评论区常提想看独立游戏",
+    language: "zh-Hant",
   },
 ];

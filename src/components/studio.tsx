@@ -10,6 +10,7 @@ import {
   PenLine,
   Plus,
   Save,
+  Search,
   Send,
   Trash2,
   Upload,
@@ -32,16 +33,24 @@ import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 import { parseRecipientText, toCsv } from "@/lib/csv";
+import { mergeDrafts, withoutSentDrafts } from "@/lib/drafts";
 import { parseKeyText } from "@/lib/keys";
 import { emptyGame, toneLabel } from "@/lib/sample";
 import { smtpPresets, type SmtpPresetId } from "@/lib/smtp-presets";
 import {
+  BLOGGER_LANGUAGES,
+  DEFAULT_BLOGGER_LANGUAGE,
+  MAX_GLOBAL_RECIPIENTS,
   MAX_RECIPIENTS,
   MAX_SMTP_BATCH,
+  bloggerLanguageLabel,
+  normalizeBloggerLanguage,
+  type BloggerLanguage,
   type Campaign,
   type Draft,
   type GameRecord,
   type InboxMessage,
+  type Recipient,
   type SendMode,
   type SmtpConfig,
   type Tone,
@@ -54,6 +63,8 @@ const steps = [
   { id: 3, label: "信件" },
   { id: 4, label: "发出" },
 ] as const;
+
+type SendCountPreset = "unsent" | "once" | "twice" | "threePlus" | "all" | "custom";
 
 function campaignOf(game: GameRecord): Campaign {
   return {
@@ -68,6 +79,23 @@ function campaignOf(game: GameRecord): Campaign {
     companyName: game.companyName,
     extraInstructions: game.extraInstructions,
   };
+}
+
+function recipientsForDrafts(drafts: Draft[], roster: Recipient[]): Recipient[] {
+  const byEmail = new Map(roster.map((item) => [item.email, item]));
+  return drafts.map((draft) => {
+    const email = draft.email.toLowerCase();
+    return (
+      byEmail.get(email) ?? {
+        id: email,
+        email,
+        name: draft.name,
+        company: "",
+        note: "",
+        language: DEFAULT_BLOGGER_LANGUAGE,
+      }
+    );
+  });
 }
 
 export function Studio() {
@@ -95,6 +123,17 @@ export function Studio() {
     mode: SendMode;
     results: InboxMessage[];
   } | null>(null);
+  const [recipients, setRecipients] = useState<Recipient[]>([]);
+  const [recipientCsv, setRecipientCsv] = useState("");
+  const [selectedEmails, setSelectedEmails] = useState<string[]>([]);
+  const [bloggersQuery, setBloggersQuery] = useState("");
+  const [uploadLanguage, setUploadLanguage] = useState<BloggerLanguage>(DEFAULT_BLOGGER_LANGUAGE);
+  const [bloggersLanguage, setBloggersLanguage] = useState<BloggerLanguage | "all">("all");
+  const [sendCountMin, setSendCountMin] = useState(0);
+  const [sendCountMax, setSendCountMax] = useState<number | null>(0);
+  const [rangeFrom, setRangeFrom] = useState(1);
+  const [rangeTo, setRangeTo] = useState(20);
+  const [inbox, setInbox] = useState<InboxMessage[]>([]);
   const saveTimer = useRef<number | null>(null);
 
   const drafts = game?.drafts ?? [];
@@ -143,12 +182,29 @@ export function Studio() {
     persist({ ...game, [key]: value });
   }
 
+  async function refreshRecipients() {
+    const response = await fetch("/api/recipients");
+    const data = await response.json();
+    const list = (data.recipients ?? []) as Recipient[];
+    setRecipients(list);
+    setRecipientCsv(typeof data.csv === "string" ? data.csv : toCsv(list));
+    return list;
+  }
+
+  async function refreshInbox() {
+    const response = await fetch("/api/inbox");
+    const data = await response.json();
+    setInbox((data.messages ?? []) as InboxMessage[]);
+  }
+
   useEffect(() => {
     void Promise.all([
       refreshGames(),
+      refreshRecipients(),
+      refreshInbox(),
       fetch("/api/smtp").then((response) => response.json()),
       fetch("/api/settings").then((response) => response.json()),
-    ]).then(([, smtpData, settings]) => {
+    ]).then(([, , , smtpData, settings]) => {
       if (smtpData.smtp) {
         setSmtp(smtpData.smtp);
         const match = (Object.keys(smtpPresets) as SmtpPresetId[]).find(
@@ -160,23 +216,48 @@ export function Studio() {
     });
   }, []);
 
-  function applyCsv(raw: string) {
-    if (!game) return;
-    const result = parseRecipientText(raw);
+  async function applyCsv(raw: string) {
+    const preview = parseRecipientText(raw, uploadLanguage);
+    const response = await fetch("/api/recipients", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ csv: raw, language: uploadLanguage }),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      toast.error(data.error || "名单没存上");
+      return;
+    }
+    const list = (data.recipients ?? []) as Recipient[];
+    setRecipients(list);
+    setRecipientCsv(typeof data.csv === "string" ? data.csv : toCsv(list));
     setParseWarning(
       [
-        result.invalid.length ? `${result.invalid.length} 条无效邮箱已忽略` : "",
-        result.truncated ? `已截断到 ${MAX_RECIPIENTS} 人` : "",
+        preview.invalid.length ? `${preview.invalid.length} 条无效邮箱已忽略` : "",
+        data.truncated ? `已截断到 ${MAX_GLOBAL_RECIPIENTS} 人` : "",
+        data.filled ? `${data.filled} 条用新数据补全了空字段` : "",
       ]
         .filter(Boolean)
         .join("；"),
     );
-    persist(
-      { ...game, recipients: result.recipients, recipientCsv: raw },
-      true,
-    );
-    if (result.recipients.length > 0) toast.success(`已读入 ${result.recipients.length} 人`);
-    else toast.error("没有有效联系人");
+    if (list.length === 0) {
+      toast.error("没有有效联系人");
+      return;
+    }
+    const added = Number(data.added) || 0;
+    if (added > 0) toast.success(`名单现有 ${list.length} 人，新增 ${added} 人`);
+    else toast.success(`名单现有 ${list.length} 人，已按邮箱去重`);
+  }
+
+  async function persistRecipients(next: Recipient[]) {
+    setRecipients(next);
+    setRecipientCsv(toCsv(next));
+    const response = await fetch("/api/recipients", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ recipients: next, replace: true }),
+    });
+    if (!response.ok) toast.error("名单没存上，请再试一次");
   }
 
   function addKeys(raw: string) {
@@ -198,8 +279,17 @@ export function Studio() {
     toast.success(`密钥池现有 ${merged.length} 个`);
   }
 
-  async function generate() {
+  async function generate(targets?: Recipient[]) {
     if (!game) return;
+    const chosen = targets ?? selectedRecipients;
+    if (chosen.length === 0) {
+      toast.error("请先勾选要写信的人");
+      return;
+    }
+    if (chosen.length > MAX_RECIPIENTS) {
+      toast.error(`单次最多生成 ${MAX_RECIPIENTS} 封`);
+      return;
+    }
     setGenerating(true);
     try {
       const response = await fetch("/api/generate", {
@@ -208,7 +298,7 @@ export function Studio() {
         body: JSON.stringify({
           gameId: game.id,
           campaign: campaignOf(game),
-          recipients: game.recipients,
+          recipients: chosen,
           attachKeys: game.attachKeys,
           keysPerEmail: game.keysPerEmail,
           keys: game.keys,
@@ -216,15 +306,23 @@ export function Studio() {
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "生成失败");
-      const next = {
-        ...game,
-        drafts: data.drafts as Draft[],
-        keys: data.remainingKeys ?? game.keys,
-      };
-      persist(next, true);
-      setActiveDraftId(data.drafts[0]?.recipientId ?? null);
+      const incoming = (data.drafts ?? []) as Draft[];
+      const merged = mergeDrafts(game.drafts, incoming);
+      persist(
+        {
+          ...game,
+          drafts: merged,
+          keys: data.remainingKeys ?? game.keys,
+        },
+        true,
+      );
+      setActiveDraftId(incoming[0]?.recipientId ?? merged[0]?.recipientId ?? null);
       setStep(3);
-      toast.success(`已生成 ${data.drafts.length} 封草稿`);
+      toast.success(
+        game.drafts.length > 0 && merged.length > incoming.length
+          ? `已生成 ${incoming.length} 封，本游戏现有 ${merged.length} 封草稿`
+          : `已生成 ${incoming.length} 封草稿`,
+      );
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "生成失败");
     } finally {
@@ -232,8 +330,13 @@ export function Studio() {
     }
   }
 
-  async function send() {
+  async function send(queue?: Draft[]) {
     if (!game) return;
+    const outgoing = (queue ?? includedDrafts).filter((draft) => draft.included);
+    if (outgoing.length === 0) {
+      toast.error("没有可发送的草稿");
+      return;
+    }
     setLastSend(null);
     setSending(true);
     try {
@@ -248,7 +351,7 @@ export function Studio() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           campaign: { ...campaignOf(game), senderEmail: smtp.user },
-          drafts: includedDrafts,
+          drafts: outgoing,
           mode,
           smtp,
           gameId: game.id,
@@ -264,13 +367,26 @@ export function Studio() {
         results: (data.results ?? []) as InboxMessage[],
       };
       setLastSend(summary);
+      const sentEmails = summary.results
+        .filter((item) => item.status === "sent")
+        .map((item) => item.to);
+      if (sentEmails.length > 0) {
+        const nextDrafts = withoutSentDrafts(drafts, sentEmails);
+        await persist({ ...game, drafts: nextDrafts }, true);
+        if (activeDraft && sentEmails.some((email) => email.toLowerCase() === activeDraft.email.toLowerCase())) {
+          setActiveDraftId(nextDrafts[0]?.recipientId ?? null);
+        }
+      }
+      await refreshInbox();
       if (summary.failed && !summary.sent) {
         toast.error(`发送失败：${summary.results[0]?.error || `${summary.failed} 封都没发出`}`);
       } else if (summary.failed) {
-        toast.error(`发出 ${summary.sent} 封，失败 ${summary.failed} 封`);
+        toast.error(`发出 ${summary.sent} 封，失败 ${summary.failed} 封。成功的草稿已删除，可等几分钟后重发失败的。`);
       } else {
         toast.success(
-          mode === "smtp" ? `已从邮箱发出 ${summary.sent} 封` : `已写入 ${summary.sent} 封记录（未真发）`,
+          mode === "smtp"
+            ? `已从邮箱发出 ${summary.sent} 封，对应草稿已删除`
+            : `已写入 ${summary.sent} 封记录（未真发），对应草稿已删除`,
         );
       }
     } catch (error) {
@@ -280,10 +396,132 @@ export function Studio() {
     }
   }
 
+  async function retryFailed() {
+    if (!game || !lastSend) return;
+    const failed = new Set(
+      lastSend.results.filter((item) => item.status === "failed").map((item) => item.to.toLowerCase()),
+    );
+    const nextDrafts = drafts.map((draft) => ({
+      ...draft,
+      included: failed.has(draft.email.toLowerCase()),
+    }));
+    await persist({ ...game, drafts: nextDrafts }, true);
+    await send(nextDrafts.filter((draft) => draft.included));
+  }
+
+  function removeDraft(recipientId: string) {
+    if (!game) return;
+    const nextDrafts = drafts.filter((draft) => draft.recipientId !== recipientId);
+    persist({ ...game, drafts: nextDrafts }, true);
+    if (activeDraftId === recipientId) {
+      setActiveDraftId(nextDrafts[0]?.recipientId ?? null);
+    }
+  }
+
+  function clearDrafts() {
+    if (!game || drafts.length === 0) return;
+    if (!confirm(`清空当前游戏的 ${drafts.length} 封草稿？博主名单和发信记录不会删。`)) return;
+    persist({ ...game, drafts: [] }, true);
+    setActiveDraftId(null);
+    toast.success("已清空草稿");
+  }
+
+  const sendCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    if (!game) return counts;
+    for (const item of inbox) {
+      if (item.gameId !== game.id || item.status !== "sent") continue;
+      const email = item.to.toLowerCase();
+      counts.set(email, (counts.get(email) ?? 0) + 1);
+    }
+    return counts;
+  }, [inbox, game]);
+
+  const sendCountPreset = useMemo<SendCountPreset>(() => {
+    if (sendCountMin === 0 && sendCountMax === 0) return "unsent";
+    if (sendCountMin === 1 && sendCountMax === 1) return "once";
+    if (sendCountMin === 2 && sendCountMax === 2) return "twice";
+    if (sendCountMin === 3 && sendCountMax === null) return "threePlus";
+    if (sendCountMin === 0 && sendCountMax === null) return "all";
+    return "custom";
+  }, [sendCountMin, sendCountMax]);
+
+  function applySendCountPreset(preset: Exclude<SendCountPreset, "custom">) {
+    if (preset === "unsent") {
+      setSendCountMin(0);
+      setSendCountMax(0);
+    } else if (preset === "once") {
+      setSendCountMin(1);
+      setSendCountMax(1);
+    } else if (preset === "twice") {
+      setSendCountMin(2);
+      setSendCountMax(2);
+    } else if (preset === "threePlus") {
+      setSendCountMin(3);
+      setSendCountMax(null);
+    } else {
+      setSendCountMin(0);
+      setSendCountMax(null);
+    }
+  }
+
+  const languageCounts = useMemo(() => {
+    const counts = Object.fromEntries(BLOGGER_LANGUAGES.map((lang) => [lang, 0])) as Record<
+      BloggerLanguage,
+      number
+    >;
+    for (const item of recipients) {
+      counts[normalizeBloggerLanguage(item.language)] += 1;
+    }
+    return counts;
+  }, [recipients]);
+
+  const filteredRecipients = useMemo(() => {
+    const q = bloggersQuery.trim().toLowerCase();
+    const min = sendCountMax === null ? sendCountMin : Math.min(sendCountMin, sendCountMax);
+    const max = sendCountMax === null ? null : Math.max(sendCountMin, sendCountMax);
+    return recipients.filter((item) => {
+      const language = normalizeBloggerLanguage(item.language);
+      if (bloggersLanguage !== "all" && language !== bloggersLanguage) return false;
+      const times = sendCounts.get(item.email) ?? 0;
+      if (times < min) return false;
+      if (max !== null && times > max) return false;
+      if (!q) return true;
+      return [item.email, item.name, item.company, item.note, bloggerLanguageLabel[language]].some(
+        (value) => value.toLowerCase().includes(q),
+      );
+    });
+  }, [recipients, bloggersQuery, bloggersLanguage, sendCounts, sendCountMin, sendCountMax]);
+
+  const rangedRecipients = useMemo(() => {
+    const from = Math.max(1, rangeFrom);
+    const to = Math.max(from, rangeTo);
+    return filteredRecipients.slice(from - 1, to);
+  }, [filteredRecipients, rangeFrom, rangeTo]);
+
+  const selectedRecipients = useMemo(() => {
+    const chosen = new Set(selectedEmails);
+    return recipients.filter((item) => chosen.has(item.email));
+  }, [recipients, selectedEmails]);
+
+  const allVisibleSelected =
+    rangedRecipients.length > 0 && rangedRecipients.every((item) => selectedEmails.includes(item.email));
+
+  function toggleSelected(email: string, checked: boolean) {
+    setSelectedEmails((current) => {
+      if (checked) return current.includes(email) ? current : [...current, email];
+      return current.filter((item) => item !== email);
+    });
+  }
+
+  function selectEmails(emails: string[]) {
+    setSelectedEmails(emails);
+  }
+
   const canGenerate = useMemo(() => {
     if (!game) return false;
     return Boolean(
-      game.recipients.length &&
+      selectedRecipients.length &&
         game.brand &&
         game.overview &&
         game.offer &&
@@ -291,7 +529,7 @@ export function Studio() {
         game.companyName &&
         game.ctaUrl,
     );
-  }, [game]);
+  }, [game, selectedRecipients.length]);
 
   if (!game) {
     return (
@@ -358,7 +596,7 @@ export function Studio() {
           <Button
             variant="ghost"
             onClick={async () => {
-              if (!confirm("删除这个游戏的全部配置、名单和密钥？发信记录仍会保留。")) return;
+              if (!confirm("删除这个游戏的配置、草稿和密钥？全局博主名单和发信记录仍会保留。")) return;
               const response = await fetch(`/api/games?id=${game.id}`, { method: "DELETE" });
               const data = await response.json();
               if (!response.ok) {
@@ -523,71 +761,282 @@ export function Studio() {
       {step === 2 ? (
         <section className="grid gap-6 lg:grid-cols-2">
           <div className="rounded-3xl bg-card p-5 ring-1 ring-foreground/10 sm:p-6">
-            <h2 className="font-heading text-xl">博主名单</h2>
+            <h2 className="font-heading text-xl">全局博主名单</h2>
             <p className="mt-1 text-sm text-muted-foreground">
-              CSV：email,name,channel,note。属于当前游戏，下次打开还会在。
+              CSV 不用改，仍是 email,name,channel,note。语言只在网页上选，这批新人会记成该语言。所有游戏共用，按邮箱自动去重；重复导入只补空字段，已有语言不会被覆盖。删人请用右侧表格。
             </p>
-            <label className={cn(buttonVariants({ variant: "outline" }), "mt-3 cursor-pointer")}>
-              <Upload />
-              上传 CSV
-              <input
-                type="file"
-                accept=".csv,.txt,text/csv"
-                className="sr-only"
-                onChange={async (event) => {
-                  const file = event.target.files?.[0];
-                  if (!file) return;
-                  const text = await file.text();
-                  applyCsv(text);
-                  event.target.value = "";
-                }}
-              />
-            </label>
+            <div className="mt-3 flex flex-wrap items-end gap-2">
+              <Field label="这批语言">
+                <Select
+                  value={uploadLanguage}
+                  onValueChange={(value) => {
+                    if (!value) return;
+                    setUploadLanguage(normalizeBloggerLanguage(value));
+                  }}
+                >
+                  <SelectTrigger className="w-36">
+                    <SelectValue>{bloggerLanguageLabel[uploadLanguage]}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {BLOGGER_LANGUAGES.map((lang) => (
+                      <SelectItem key={lang} value={lang}>
+                        {bloggerLanguageLabel[lang]}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </Field>
+              <label className={cn(buttonVariants({ variant: "outline" }), "cursor-pointer")}>
+                <Upload />
+                上传 CSV
+                <input
+                  type="file"
+                  accept=".csv,.txt,text/csv"
+                  className="sr-only"
+                  onChange={async (event) => {
+                    const file = event.target.files?.[0];
+                    if (!file) return;
+                    const text = await file.text();
+                    await applyCsv(text);
+                    event.target.value = "";
+                  }}
+                />
+              </label>
+            </div>
             <Textarea
               className="mt-4 min-h-48 font-mono text-xs"
-              value={game.recipientCsv}
-              onChange={(event) => patch("recipientCsv", event.target.value)}
+              value={recipientCsv}
+              onChange={(event) => setRecipientCsv(event.target.value)}
             />
-            <div className="mt-3 flex gap-2">
-              <Button onClick={() => applyCsv(game.recipientCsv)}>解析名单</Button>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Button onClick={() => void applyCsv(recipientCsv)}>解析并合并</Button>
               <Button variant="ghost" onClick={() => setStep(1)}>
                 返回游戏
               </Button>
+              {recipients.length > 0 ? (
+                <Button
+                  variant="ghost"
+                  onClick={async () => {
+                    if (!confirm("清空全局博主名单？各游戏的草稿和发信记录不会删。")) return;
+                    await persistRecipients([]);
+                    setSelectedEmails([]);
+                    toast.success("已清空名单");
+                  }}
+                >
+                  清空名单
+                </Button>
+              ) : null}
             </div>
             {parseWarning ? <p className="mt-3 text-sm text-destructive">{parseWarning}</p> : null}
+            <p className="mt-3 text-xs text-muted-foreground">
+              全局 {recipients.length} 人，上限 {MAX_GLOBAL_RECIPIENTS}。
+            </p>
           </div>
           <div className="rounded-3xl bg-card p-5 ring-1 ring-foreground/10 sm:p-6">
-            <div className="mb-3 flex items-center justify-between">
-              <h3 className="font-heading text-lg">将收到邀请的人</h3>
-              <Badge variant="secondary">{game.recipients.length} 人</Badge>
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <h3 className="font-heading text-lg">这次写信给谁</h3>
+              <Badge variant="secondary">已勾选 {selectedRecipients.length}</Badge>
             </div>
-            {game.recipients.length === 0 ? (
-              <div className="flex min-h-40 flex-col items-center justify-center rounded-2xl bg-muted/60 text-sm text-muted-foreground">
+            <div className="grid gap-2 sm:grid-cols-2">
+              <div className="relative sm:col-span-2">
+                <Search className="pointer-events-none absolute top-2.5 left-2.5 size-4 text-muted-foreground" />
+                <Input
+                  className="pl-8"
+                  placeholder="搜索邮箱、姓名、频道"
+                  value={bloggersQuery}
+                  onChange={(event) => setBloggersQuery(event.target.value)}
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <Field label="最少次数">
+                  <Input
+                    type="number"
+                    min={0}
+                    value={sendCountMin}
+                    onChange={(event) => setSendCountMin(Math.max(0, Number(event.target.value) || 0))}
+                  />
+                </Field>
+                <Field label="最多次数">
+                  <Input
+                    type="number"
+                    min={0}
+                    placeholder="不限"
+                    value={sendCountMax ?? ""}
+                    onChange={(event) => {
+                      const raw = event.target.value.trim();
+                      if (raw === "") {
+                        setSendCountMax(null);
+                        return;
+                      }
+                      setSendCountMax(Math.max(0, Number(raw) || 0));
+                    }}
+                  />
+                </Field>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <Field label="从第">
+                  <Input
+                    type="number"
+                    min={1}
+                    value={rangeFrom}
+                    onChange={(event) => setRangeFrom(Math.max(1, Number(event.target.value) || 1))}
+                  />
+                </Field>
+                <Field label="到第">
+                  <Input
+                    type="number"
+                    min={1}
+                    value={rangeTo}
+                    onChange={(event) => setRangeTo(Math.max(1, Number(event.target.value) || 1))}
+                  />
+                </Field>
+              </div>
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Button
+                size="sm"
+                variant={bloggersLanguage === "all" ? "default" : "outline"}
+                onClick={() => setBloggersLanguage("all")}
+              >
+                全部 {recipients.length}
+              </Button>
+              {BLOGGER_LANGUAGES.map((lang) => (
+                <Button
+                  key={lang}
+                  size="sm"
+                  variant={bloggersLanguage === lang ? "default" : "outline"}
+                  onClick={() => setBloggersLanguage(lang)}
+                >
+                  {bloggerLanguageLabel[lang]} {languageCounts[lang]}
+                </Button>
+              ))}
+            </div>
+            <div className="mt-2 flex flex-wrap gap-2">
+              {(
+                [
+                  ["unsent", "未发过"],
+                  ["once", "1 次"],
+                  ["twice", "2 次"],
+                  ["threePlus", "≥ 3 次"],
+                  ["all", "全部"],
+                ] as const
+              ).map(([preset, label]) => (
+                <Button
+                  key={preset}
+                  size="sm"
+                  variant={sendCountPreset === preset ? "default" : "outline"}
+                  onClick={() => applySendCountPreset(preset)}
+                >
+                  {label}
+                </Button>
+              ))}
+            </div>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  setRangeFrom(1);
+                  setRangeTo(20);
+                  selectEmails(filteredRecipients.slice(0, 20).map((item) => item.email));
+                }}
+              >
+                前 20 个
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => selectEmails(rangedRecipients.map((item) => item.email))}
+              >
+                勾选当前范围
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  setRangeFrom(1);
+                  setRangeTo(Math.max(1, filteredRecipients.length));
+                  selectEmails(filteredRecipients.map((item) => item.email));
+                }}
+              >
+                勾选全部筛选
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => setSelectedEmails([])}>
+                清空勾选
+              </Button>
+            </div>
+            <p className="mt-2 text-xs text-muted-foreground">
+              筛选后 {filteredRecipients.length} 人，当前范围 {rangedRecipients.length} 人。次数按当前游戏成功发出的记录统计。单次最多生成{" "}
+              {MAX_RECIPIENTS} 封。
+            </p>
+            {recipients.length === 0 ? (
+              <div className="mt-3 flex min-h-40 flex-col items-center justify-center rounded-2xl bg-muted/60 text-sm text-muted-foreground">
                 <AlertCircle className="mb-2 size-5" />
                 还没有联系人
               </div>
+            ) : rangedRecipients.length === 0 ? (
+              <div className="mt-3 flex min-h-40 flex-col items-center justify-center rounded-2xl bg-muted/60 text-sm text-muted-foreground">
+                当前筛选没有人
+              </div>
             ) : (
-              <div className="max-h-[360px] overflow-auto rounded-xl ring-1 ring-foreground/10">
+              <div className="mt-3 max-h-[360px] overflow-auto rounded-xl ring-1 ring-foreground/10">
                 <Table>
                   <TableHeader>
                     <TableRow>
+                      <TableHead className="w-10">
+                        <Checkbox
+                          checked={allVisibleSelected}
+                          onCheckedChange={(checked) => {
+                            if (checked) {
+                              const next = new Set(selectedEmails);
+                              for (const item of rangedRecipients) next.add(item.email);
+                              setSelectedEmails([...next]);
+                            } else {
+                              const hide = new Set(rangedRecipients.map((item) => item.email));
+                              setSelectedEmails(selectedEmails.filter((email) => !hide.has(email)));
+                            }
+                          }}
+                        />
+                      </TableHead>
                       <TableHead>邮箱</TableHead>
                       <TableHead>博主</TableHead>
+                      <TableHead className="w-14">语言</TableHead>
+                      <TableHead className="w-16">次数</TableHead>
                       <TableHead className="w-12" />
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {game.recipients.map((item) => (
+                    {rangedRecipients.map((item) => (
                       <TableRow key={item.id}>
+                        <TableCell>
+                          <Checkbox
+                            checked={selectedEmails.includes(item.email)}
+                            onCheckedChange={(checked) => toggleSelected(item.email, Boolean(checked))}
+                          />
+                        </TableCell>
                         <TableCell className="font-mono text-xs">{item.email}</TableCell>
                         <TableCell>{item.name || item.company || "—"}</TableCell>
+                        <TableCell className="text-xs text-muted-foreground">
+                          {bloggerLanguageLabel[normalizeBloggerLanguage(item.language)]}
+                        </TableCell>
+                        <TableCell>
+                          {(() => {
+                            const times = sendCounts.get(item.email) ?? 0;
+                            return times > 0 ? (
+                              <Badge variant="secondary">{times} 次</Badge>
+                            ) : (
+                              <span className="text-xs text-muted-foreground">未发</span>
+                            );
+                          })()}
+                        </TableCell>
                         <TableCell>
                           <Button
                             size="icon-xs"
                             variant="ghost"
-                            onClick={() => {
-                              const recipients = game.recipients.filter((row) => row.id !== item.id);
-                              persist({ ...game, recipients, recipientCsv: toCsv(recipients) }, true);
+                            onClick={async () => {
+                              const next = recipients.filter((row) => row.email !== item.email);
+                              await persistRecipients(next);
+                              setSelectedEmails((current) => current.filter((email) => email !== item.email));
                             }}
                           >
                             <Trash2 />
@@ -602,11 +1051,11 @@ export function Studio() {
             <Button
               size="lg"
               className="mt-4 h-11 w-full rounded-full"
-              disabled={!canGenerate || generating || aiConfigured === false}
+              disabled={!canGenerate || generating || aiConfigured === false || selectedRecipients.length > MAX_RECIPIENTS}
               onClick={() => void generate()}
             >
               {generating ? <Loader2 className="animate-spin" /> : <PenLine />}
-              {generating ? "正在生成…" : "生成草稿"}
+              {generating ? "正在生成…" : `为已勾选的 ${selectedRecipients.length} 人生成草稿`}
             </Button>
           </div>
         </section>
@@ -615,25 +1064,47 @@ export function Studio() {
       {step === 3 ? (
         <section className="grid gap-4 lg:grid-cols-[280px_1fr]">
           <div className="rounded-3xl bg-card p-4 ring-1 ring-foreground/10">
-            <h2 className="font-heading text-lg">草稿</h2>
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="font-heading text-lg">草稿</h2>
+              {drafts.length > 0 ? (
+                <Button size="xs" variant="ghost" onClick={clearDrafts}>
+                  清空草稿
+                </Button>
+              ) : null}
+            </div>
             {drafts.length === 0 ? (
               <p className="mt-6 text-sm text-muted-foreground">还没有草稿。</p>
             ) : (
               <div className="mt-2 flex max-h-[540px] flex-col gap-1 overflow-auto">
                 {drafts.map((draft) => (
-                  <button
+                  <div
                     key={draft.recipientId}
-                    type="button"
-                    onClick={() => setActiveDraftId(draft.recipientId)}
                     className={cn(
-                      "rounded-xl px-3 py-2 text-left text-sm",
+                      "flex items-center gap-0.5 rounded-xl",
                       activeDraft?.recipientId === draft.recipientId ? "bg-accent" : "hover:bg-muted",
                       !draft.included && "opacity-50",
                     )}
                   >
-                    <div className="truncate font-medium">{draft.name || draft.email}</div>
-                    <div className="truncate text-xs text-muted-foreground">{draft.subject}</div>
-                  </button>
+                    <button
+                      type="button"
+                      onClick={() => setActiveDraftId(draft.recipientId)}
+                      className="min-w-0 flex-1 rounded-xl px-3 py-2 text-left text-sm"
+                    >
+                      <div className="truncate font-medium">{draft.name || draft.email}</div>
+                      <div className="truncate text-xs text-muted-foreground">{draft.subject}</div>
+                    </button>
+                    <Button
+                      size="icon-xs"
+                      variant="ghost"
+                      className="mr-1"
+                      onClick={() => {
+                        if (!confirm("删除这封草稿？")) return;
+                        removeDraft(draft.recipientId);
+                      }}
+                    >
+                      <Trash2 />
+                    </Button>
+                  </div>
                 ))}
               </div>
             )}
@@ -694,9 +1165,25 @@ export function Studio() {
                   })
                 }
               />
-              <div className="mt-4 flex gap-2">
-                <Button variant="outline" disabled={generating} onClick={() => void generate()}>
+              <div className="mt-4 flex flex-wrap gap-2">
+                <Button
+                  variant="outline"
+                  disabled={generating || drafts.length === 0}
+                  onClick={() => void generate(recipientsForDrafts(drafts, recipients))}
+                >
                   {generating ? "正在生成…" : "重新生成"}
+                </Button>
+                <Button
+                  variant="ghost"
+                  onClick={() => {
+                    if (!confirm("删除这封草稿？")) return;
+                    removeDraft(activeDraft.recipientId);
+                  }}
+                >
+                  删除这篇
+                </Button>
+                <Button variant="ghost" onClick={clearDrafts}>
+                  清空草稿
                 </Button>
                 <Button className="rounded-full" disabled={includedDrafts.length === 0} onClick={() => setStep(4)}>
                   去发出（{includedDrafts.length} 封）
@@ -712,7 +1199,8 @@ export function Studio() {
           <div className="rounded-3xl bg-card p-5 ring-1 ring-foreground/10 sm:p-6">
             <h2 className="font-heading text-xl">发出</h2>
             <p className="mt-1 text-sm text-muted-foreground">
-              默认从你的邮箱真发。发件人必须和 SMTP 账号相同。单次最多 {MAX_SMTP_BATCH} 封。
+              默认从你的邮箱真发。发件人必须和 SMTP 账号相同。单次最多 {MAX_SMTP_BATCH} 封。QQ
+              会复用同一条登录，并在每封之间留几秒间隔，避免 535 限频。
             </p>
             <div className="mt-4 flex items-center justify-between gap-3">
               <Label>模拟写入记录（不经过邮局）</Label>
@@ -808,6 +1296,9 @@ export function Studio() {
                 </Button>
               </div>
             ) : null}
+            {mode === "smtp" ? (
+              <p className="mt-3 text-xs text-muted-foreground">{smtpPresets[smtpPreset].hint}</p>
+            ) : null}
             <Button
               size="lg"
               className="mt-5 h-11 w-full rounded-full"
@@ -818,25 +1309,32 @@ export function Studio() {
               {sending ? "正在发送…" : mode === "smtp" ? "从我的邮箱发出" : "只写入记录"}
             </Button>
             {lastSend ? (
-              <p className="mt-3 text-sm">
-                {lastSend.failed === 0 ? (
-                  <span>
-                    {lastSend.mode === "smtp"
-                      ? `已发出 ${lastSend.sent} 封。`
-                      : `已写入 ${lastSend.sent} 封记录（未真发）。`}
-                  </span>
-                ) : (
-                  <span className="text-destructive">
-                    成功 {lastSend.sent} 封，失败 {lastSend.failed} 封
-                    {lastSend.results.find((item) => item.status === "failed")?.error
-                      ? `：${lastSend.results.find((item) => item.status === "failed")?.error}`
-                      : "。"}
-                  </span>
-                )}{" "}
-                <Link href="/history" className="text-muted-foreground underline">
-                  查看记录
-                </Link>
-              </p>
+              <div className="mt-3 space-y-2 text-sm">
+                <p>
+                  {lastSend.failed === 0 ? (
+                    <span>
+                      {lastSend.mode === "smtp"
+                        ? `已发出 ${lastSend.sent} 封。`
+                        : `已写入 ${lastSend.sent} 封记录（未真发）。`}
+                    </span>
+                  ) : (
+                    <span className="text-destructive">
+                      成功 {lastSend.sent} 封，失败 {lastSend.failed} 封
+                      {lastSend.results.find((item) => item.status === "failed")?.error
+                        ? `：${lastSend.results.find((item) => item.status === "failed")?.error}`
+                        : "。"}
+                    </span>
+                  )}{" "}
+                  <Link href="/history" className="text-muted-foreground underline">
+                    查看记录
+                  </Link>
+                </p>
+                {lastSend.failed > 0 ? (
+                  <Button variant="outline" disabled={sending} onClick={() => void retryFailed()}>
+                    重发失败的 {lastSend.failed} 封
+                  </Button>
+                ) : null}
+              </div>
             ) : null}
           </div>
           <div className="rounded-3xl bg-card p-5 ring-1 ring-foreground/10 sm:p-6">

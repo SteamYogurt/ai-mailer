@@ -1,10 +1,20 @@
-import type { Recipient } from "@/lib/types";
-import { MAX_RECIPIENTS } from "@/lib/types";
+import {
+  DEFAULT_BLOGGER_LANGUAGE,
+  isBloggerLanguage,
+  MAX_GLOBAL_RECIPIENTS,
+  normalizeBloggerLanguage,
+  type BloggerLanguage,
+  type Recipient,
+} from "@/lib/types";
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export function isValidEmail(value: string) {
   return EMAIL_RE.test(value.trim().toLowerCase());
+}
+
+export function recipientKey(email: string) {
+  return email.trim().toLowerCase();
 }
 
 function splitCsvLine(line: string) {
@@ -40,17 +50,18 @@ function headerKey(value: string) {
   return value.trim().toLowerCase().replace(/\s+/g, "");
 }
 
-function makeId(email: string, index: number) {
-  return `${email.toLowerCase()}-${index}`;
-}
-
 export type ParseResult = {
   recipients: Recipient[];
   invalid: string[];
   truncated: boolean;
 };
 
-export function parseRecipientText(raw: string): ParseResult {
+export function parseRecipientText(
+  raw: string,
+  language: BloggerLanguage = DEFAULT_BLOGGER_LANGUAGE,
+  limit = MAX_GLOBAL_RECIPIENTS,
+): ParseResult {
+  const fallbackLanguage = normalizeBloggerLanguage(language);
   const text = raw.replace(/^\uFEFF/, "").trim();
   if (!text) {
     return { recipients: [], invalid: [], truncated: false };
@@ -71,7 +82,7 @@ export function parseRecipientText(raw: string): ParseResult {
   const seen = new Set<string>();
 
   const push = (email: string, name: string, company: string, note: string) => {
-    const normalized = email.trim().toLowerCase();
+    const normalized = recipientKey(email);
     if (!normalized) return;
     if (!isValidEmail(normalized)) {
       invalid.push(email);
@@ -80,11 +91,12 @@ export function parseRecipientText(raw: string): ParseResult {
     if (seen.has(normalized)) return;
     seen.add(normalized);
     recipients.push({
-      id: makeId(normalized, recipients.length),
+      id: normalized,
       email: normalized,
       name: name.trim(),
       company: company.trim(),
       note: note.trim(),
+      language: fallbackLanguage,
     });
   };
 
@@ -122,9 +134,82 @@ export function parseRecipientText(raw: string): ParseResult {
   }
 
   return {
-    recipients: recipients.slice(0, MAX_RECIPIENTS),
+    recipients: recipients.slice(0, limit),
     invalid,
-    truncated: recipients.length > MAX_RECIPIENTS,
+    truncated: recipients.length > limit,
+  };
+}
+
+function fillBlank(current: string, incoming: string) {
+  return current.trim() || incoming.trim();
+}
+
+function recipientLanguage(item: Partial<Recipient> | Recipient) {
+  return normalizeBloggerLanguage(item.language);
+}
+
+function fillLanguage(current: BloggerLanguage | string | undefined, incoming?: string) {
+  if (current && isBloggerLanguage(current)) return current;
+  return normalizeBloggerLanguage(incoming);
+}
+
+export function mergeRecipients(existing: Recipient[], incoming: Recipient[], limit = MAX_GLOBAL_RECIPIENTS) {
+  const byEmail = new Map<string, Recipient>();
+  for (const item of existing) {
+    const email = recipientKey(item.email);
+    if (!email || !isValidEmail(email)) continue;
+    byEmail.set(email, {
+      id: item.id || email,
+      email,
+      name: item.name.trim(),
+      company: item.company.trim(),
+      note: item.note.trim(),
+      language: recipientLanguage(item),
+    });
+  }
+
+  let added = 0;
+  let filled = 0;
+  for (const item of incoming) {
+    const email = recipientKey(item.email);
+    if (!email || !isValidEmail(email)) continue;
+    const current = byEmail.get(email);
+    if (!current) {
+      byEmail.set(email, {
+        id: item.id || email,
+        email,
+        name: item.name.trim(),
+        company: item.company.trim(),
+        note: item.note.trim(),
+        language: recipientLanguage(item),
+      });
+      added += 1;
+      continue;
+    }
+    const next: Recipient = {
+      ...current,
+      name: fillBlank(current.name, item.name),
+      company: fillBlank(current.company, item.company),
+      note: fillBlank(current.note, item.note),
+      language: fillLanguage(current.language, item.language),
+    };
+    if (
+      next.name !== current.name ||
+      next.company !== current.company ||
+      next.note !== current.note ||
+      next.language !== current.language
+    ) {
+      filled += 1;
+      byEmail.set(email, next);
+    }
+  }
+
+  const recipients = [...byEmail.values()];
+  return {
+    recipients: recipients.slice(0, limit),
+    added,
+    filled,
+    truncated: recipients.length > limit,
   };
 }
 

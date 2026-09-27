@@ -1,6 +1,7 @@
 import { mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+import { mergeRecipients } from "@/lib/csv";
 import { emptyGame } from "@/lib/sample";
 import {
   DEFAULT_AI_BASE_URL,
@@ -9,6 +10,8 @@ import {
   type ChatMessage,
   type GameRecord,
   type InboxMessage,
+  type LegacyGameRecord,
+  type Recipient,
   type SmtpConfig,
 } from "@/lib/types";
 
@@ -19,6 +22,7 @@ const settingsFile = path.join(USERDATA_DIR, "settings.json");
 const inboxFile = path.join(USERDATA_DIR, "inbox.json");
 const chatFile = path.join(USERDATA_DIR, "chat.json");
 const workspaceFile = path.join(USERDATA_DIR, "workspace.json");
+const recipientsFile = path.join(USERDATA_DIR, "recipients.json");
 
 async function readJson<T>(file: string, fallback: T): Promise<T> {
   try {
@@ -34,15 +38,26 @@ async function writeJson(file: string, value: unknown) {
   await writeFile(file, JSON.stringify(value, null, 2), "utf8");
 }
 
-export async function listGames(): Promise<GameRecord[]> {
+function stripLegacyGame(game: LegacyGameRecord): GameRecord {
+  const { recipients: _recipients, recipientCsv: _recipientCsv, ...rest } = game;
+  return rest;
+}
+
+async function readGameFiles(): Promise<LegacyGameRecord[]> {
   await mkdir(gamesDir, { recursive: true });
   const names = await readdir(gamesDir);
-  const games: GameRecord[] = [];
+  const games: LegacyGameRecord[] = [];
   for (const name of names) {
     if (!name.endsWith(".json")) continue;
-    const game = await readJson<GameRecord | null>(path.join(gamesDir, name), null);
+    const game = await readJson<LegacyGameRecord | null>(path.join(gamesDir, name), null);
     if (game?.id) games.push(game);
   }
+  return games;
+}
+
+export async function listGames(): Promise<GameRecord[]> {
+  await migrateRecipientsFromGames();
+  const games = (await readGameFiles()).map(stripLegacyGame);
   games.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
   if (games.length === 0) {
     const created = emptyGame();
@@ -53,13 +68,63 @@ export async function listGames(): Promise<GameRecord[]> {
 }
 
 export async function getGame(id: string) {
-  return readJson<GameRecord | null>(path.join(gamesDir, `${id}.json`), null);
+  const game = await readJson<LegacyGameRecord | null>(path.join(gamesDir, `${id}.json`), null);
+  return game?.id ? stripLegacyGame(game) : null;
 }
 
 export async function saveGame(game: GameRecord) {
-  const next: GameRecord = { ...game, updatedAt: new Date().toISOString() };
+  const next = stripLegacyGame({ ...game, updatedAt: new Date().toISOString() });
   await writeJson(path.join(gamesDir, `${next.id}.json`), next);
   return next;
+}
+
+export async function getRecipients(): Promise<Recipient[]> {
+  await migrateRecipientsFromGames();
+  const saved = await readJson<Recipient[]>(recipientsFile, []);
+  const next = mergeRecipients([], saved).recipients;
+  const needsLanguage = saved.some((item) => !item?.language);
+  if (needsLanguage && next.length > 0) {
+    await writeJson(recipientsFile, next);
+  }
+  return next;
+}
+
+export async function saveRecipients(recipients: Recipient[]) {
+  const next = mergeRecipients([], recipients).recipients;
+  await writeJson(recipientsFile, next);
+  return next;
+}
+
+let migratingRecipients: Promise<void> | null = null;
+
+async function migrateRecipientsFromGames() {
+  if (migratingRecipients) {
+    await migratingRecipients;
+    return;
+  }
+  migratingRecipients = (async () => {
+    const games = await readGameFiles();
+    const leftover = games.flatMap((game) => game.recipients ?? []);
+    const needsStrip = games.some(
+      (game) => game.recipients !== undefined || game.recipientCsv !== undefined,
+    );
+    if (leftover.length === 0 && !needsStrip) return;
+
+    const existing = await readJson<Recipient[]>(recipientsFile, []);
+    if (leftover.length > 0) {
+      await writeJson(recipientsFile, mergeRecipients(existing, leftover).recipients);
+    }
+    if (needsStrip) {
+      for (const game of games) {
+        await writeJson(path.join(gamesDir, `${game.id}.json`), stripLegacyGame(game));
+      }
+    }
+  })();
+  try {
+    await migratingRecipients;
+  } finally {
+    migratingRecipients = null;
+  }
 }
 
 export async function deleteGame(id: string) {

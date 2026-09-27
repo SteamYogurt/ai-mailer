@@ -11,7 +11,7 @@ export const smtpPresets = {
     host: "smtp.qq.com",
     port: 465,
     secure: true,
-    hint: "用户名填完整 QQ 邮箱。密码填授权码，不是 QQ 登录密码。发送服务器 smtp.qq.com，SSL 端口 465（也可改 587 并取消勾选 SMTPS）。收信用的 IMAP 不用填。",
+    hint: "用户名填完整 QQ 邮箱。密码填授权码，不是 QQ 登录密码。发送服务器 smtp.qq.com，SSL 端口 465。QQ 对登录次数很严，连发会 535 限频；应用会复用同一条连接并在每封之间留间隔。失败的请等几分钟再只发失败的那几封。",
   },
   outlook: {
     label: "Outlook / Microsoft 365",

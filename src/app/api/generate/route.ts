@@ -1,4 +1,5 @@
 import { looksDeceptive } from "@/lib/compliance";
+import { mergeDrafts } from "@/lib/drafts";
 import { generateDrafts } from "@/lib/generate";
 import { allocateKeys } from "@/lib/keys";
 import { getGame, saveGame } from "@/lib/store";
@@ -39,7 +40,7 @@ export async function POST(request: Request) {
     return Response.json({ error: `请先补全：${missing.join("、")}` }, { status: 400 });
   }
   if (recipients.length === 0) {
-    return Response.json({ error: "请先导入至少一位收件人" }, { status: 400 });
+    return Response.json({ error: "请先选择至少一位收件人" }, { status: 400 });
   }
 
   let pool = body.keys ?? [];
@@ -63,23 +64,23 @@ export async function POST(request: Request) {
 
   try {
     const drafts = await generateDrafts(campaign, recipients, keysByEmail);
+    const incoming = drafts.map((draft) => ({ ...draft, included: true }));
     if (body.gameId) {
       const game = await getGame(body.gameId);
       if (game) {
         await saveGame({
           ...game,
           ...campaign,
-          recipients,
           keys: remaining,
           attachKeys: Boolean(body.attachKeys),
           keysPerEmail: body.keysPerEmail ?? game.keysPerEmail,
-          drafts: drafts.map((draft) => ({ ...draft, included: true })),
+          drafts: mergeDrafts(game.drafts, incoming),
         });
       }
     }
 
     return Response.json({
-      drafts: drafts.map((draft) => ({ ...draft, included: true })),
+      drafts: incoming,
       remainingKeys: remaining,
       engine: "deepseek",
       flagged: drafts.filter((draft) => looksDeceptive(draft.subject)).map((draft) => draft.email),
